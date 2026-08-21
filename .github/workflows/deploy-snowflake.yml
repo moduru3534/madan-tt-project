@@ -1,0 +1,194 @@
+name: Deploy changed Snowflake objects
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+    paths:
+      - 'sql/**'
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - 'sql/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validate_repository:
+    name: Validate SQL repository
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate SQL files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d sql
+          find sql -type f -name '*.sql' -print -quit | grep -q .
+          git diff --check
+
+          if grep -R -nE 'SNOWFLAKE_LEARNING_DB|<DEV_DATABASE>|<PROD_DATABASE>' sql; then
+            echo 'Replace hardcoded environment names with Snowflake CLI variables.'
+            exit 1
+          fi
+
+  deploy_dev:
+    name: Deploy changed SQL to DEV
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    environment: DEV
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_DATABASE: ${{ vars.SNOWFLAKE_DATABASE }}
+      SNOWFLAKE_SCHEMA: ${{ vars.SNOWFLAKE_SCHEMA }}
+      SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+    steps:
+      - name: Check out repository with history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Snowflake CLI and configure OIDC
+        uses: snowflakedb/snowflake-actions@v3
+        with:
+          use-oidc: true
+          cli-version: '3.16'
+
+      - name: Test Snowflake connection
+        run: snow connection test -x
+
+      - name: Find changed SQL files
+        id: changed_sql
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_sha='${{ github.event.before }}'
+
+          if [ -z "$base_sha" ] || [ "$base_sha" = '0000000000000000000000000000000000000000' ]; then
+            base_sha="$(git rev-parse HEAD^)"
+          fi
+
+          git diff --name-only "$base_sha" "$GITHUB_SHA" -- sql/ \
+            | grep -E '\.sql$' \
+            | sort > all_changed_sql.txt || true
+
+          : > changed_sql.txt
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] || continue
+            printf '%s\n' "$file" >> changed_sql.txt
+          done < all_changed_sql.txt
+
+          if [ -s changed_sql.txt ]; then
+            echo 'has_changes=true' >> "$GITHUB_OUTPUT"
+            echo 'SQL files to deploy:'
+            cat changed_sql.txt
+          else
+            echo 'has_changes=false' >> "$GITHUB_OUTPUT"
+            echo 'No current SQL files changed.'
+          fi
+
+      - name: Deploy changed SQL files to DEV
+        if: steps.changed_sql.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r file; do
+            echo "Deploying $file"
+            snow sql \
+              -f "$file" \
+              -D "database=$SNOWFLAKE_DATABASE" \
+              -D "schema=$SNOWFLAKE_SCHEMA" \
+              -D "warehouse=$SNOWFLAKE_WAREHOUSE" \
+              --enable-templating STANDARD \
+              -x
+          done < changed_sql.txt
+
+  deploy_prod:
+    name: Deploy changed SQL to PROD
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: PROD
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_DATABASE: ${{ vars.SNOWFLAKE_DATABASE }}
+      SNOWFLAKE_SCHEMA: ${{ vars.SNOWFLAKE_SCHEMA }}
+      SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+    steps:
+      - name: Check out repository with history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Snowflake CLI and configure OIDC
+        uses: snowflakedb/snowflake-actions@v3
+        with:
+          use-oidc: true
+          cli-version: '3.16'
+
+      - name: Test Snowflake connection
+        run: snow connection test -x
+
+      - name: Find changed SQL files
+        id: changed_sql
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_sha='${{ github.event.before }}'
+
+          if [ -z "$base_sha" ] || [ "$base_sha" = '0000000000000000000000000000000000000000' ]; then
+            base_sha="$(git rev-parse HEAD^)"
+          fi
+
+          git diff --name-only "$base_sha" "$GITHUB_SHA" -- sql/ \
+            | grep -E '\.sql$' \
+            | sort > all_changed_sql.txt || true
+
+          : > changed_sql.txt
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] || continue
+            printf '%s\n' "$file" >> changed_sql.txt
+          done < all_changed_sql.txt
+
+          if [ -s changed_sql.txt ]; then
+            echo 'has_changes=true' >> "$GITHUB_OUTPUT"
+            echo 'SQL files to deploy:'
+            cat changed_sql.txt
+          else
+            echo 'has_changes=false' >> "$GITHUB_OUTPUT"
+            echo 'No current SQL files changed.'
+          fi
+
+      - name: Deploy changed SQL files to PROD
+        if: steps.changed_sql.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r file; do
+            echo "Deploying $file"
+            snow sql \
+              -f "$file" \
+              -D "database=$SNOWFLAKE_DATABASE" \
+              -D "schema=$SNOWFLAKE_SCHEMA" \
+              -D "warehouse=$SNOWFLAKE_WAREHOUSE" \
+              --enable-templating STANDARD \
+              -x
+          done < changed_sql.txt
